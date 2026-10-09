@@ -1,79 +1,60 @@
 # ADR-001: Tenant Security and Worker Hosting
 
-Status: Accepted for remediation baseline
+Status: Updated after P0 remediation
 Date: 2026-10-09
 
 ## Context
 
-Marketing MVP runs as a logical module inside the existing Scimior Node.js deployment. Review findings identified tenant isolation and shared-runtime worker risks as blockers.
+Marketing remains a logically decoupled module in the existing Render-hosted Node.js process.
+Initial readiness review identified security and migration-risk P0 blockers.
 
 ## Decision
 
-### 1. Tenant security model
+### 1. Tenant security
 
-- Enable PostgreSQL RLS on tenant-owned Marketing tables.
-- Use a transaction-scoped tenant context for app role sessions:
-  - SET LOCAL app.current_organization_id = '<uuid>'
-  - SET LOCAL app.current_user_id = '<uuid>'
-- RLS policies reference current_setting('app.current_organization_id', true).
-- Privileged paths that must cross tenant boundaries are limited to service_role routines and audited.
+Adopt a role-scoped, force-RLS model:
+- marketing_app_role is tenant-scoped only
+- marketing_service_role handles audited privileged workflows
+- marketing_bootstrap_role handles public/pre-tenant workflows
 
-### 2. Database roles
+App role must never read/create global NULL-tenant webhook or audit rows.
 
-- marketing_owner: schema owner and migration executor (not used by runtime API).
-- marketing_app_role: runtime role used by API for tenant-scoped application queries.
-- marketing_service_role: restricted privileged role for system jobs, webhook reconciliation, and cross-tenant administrative operations where explicitly required.
+### 2. GUC boundary
 
-### 3. Connection pool behavior
+Use transaction-scoped context (`SET LOCAL`) for tenant and user IDs.
+This is a query-scope control, not infrastructure identity proof.
 
-- Separate Marketing pool from Scimior pool.
-- Pool budget for shared process MVP:
-  - marketing_app_role pool max: NEEDS APPROVAL
-  - marketing_service_role pool max: NEEDS APPROVAL
-- Every request and worker claim transaction sets tenant context before queries.
-- Reset tenant context between pooled connections using transaction scope only (SET LOCAL), never session-global SET.
+### 3. Ownership and grants
 
-### 4. Worker hosting strategy
+- marketing_owner owns schema objects and executes migrations.
+- runtime roles do not own tables.
+- no broad BYPASSRLS for runtime roles.
 
-- Worker runs in same Node.js process for MVP.
-- Worker must be bounded by:
-  - global concurrency cap
-  - per-organization concurrency cap
-  - DB claim batch size
-- Graceful shutdown is mandatory:
-  - stop new claims
-  - finish/abandon safely with lock expiry
-  - flush heartbeat
-  - close pool cleanly
+NEEDS APPROVAL: exact marketing_service_role object-level grants.
+Recommended default: grant only required objects and operations for webhook/worker paths.
+
+### 4. Worker hosting in shared process
+
+Worker remains in same process for MVP with safeguards:
+- bounded global concurrency
+- bounded per-organization concurrency
+- bounded claim batch size
+- graceful shutdown sequence required
+
+NEEDS APPROVAL: exact numeric limits.
+Recommended default: conservative caps with feature flag disabled until measured.
 
 ## Consequences
 
 Positive:
-- Stronger defense-in-depth tenant isolation.
-- Lower risk of accidental cross-tenant data exposure.
-- Shared-hosting remains feasible within approved MVP constraints.
+- Explicit role boundary with reduced accidental cross-tenant access risk.
+- Bootstrap/public flows defined without leaking tenant-global data to app role.
 
-Trade-offs:
-- More SQL and runtime context management complexity.
-- Requires disciplined role and migration management.
-
-## Alternatives considered
-
-1. App-layer-only tenant checks without RLS
-- Rejected for baseline due to higher blast radius risk.
-
-2. Separate worker service on day one
-- Deferred due to current hosting constraint, but remains future extraction path.
-
-## Operational guardrails
-
-- Queue age and claim-latency alerts.
-- Pool saturation alerts.
-- API p95 latency SLO alerts.
-- Worker kill-switch for incident mitigation.
+Trade-off:
+- More operational complexity (roles, grants, auditing).
 
 ## Open items
 
-- Exact pool sizes: NEEDS APPROVAL
-- Exact per-organization concurrency limits: NEEDS APPROVAL
+- Pool sizes per role: NEEDS APPROVAL
+- Worker concurrency and claim batch values: NEEDS APPROVAL
 - Render resource envelope confirmation: NEEDS APPROVAL

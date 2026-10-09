@@ -1,18 +1,55 @@
--- Scimior Marketing PostgreSQL schema (remediated draft)
+-- Scimior Marketing PostgreSQL schema (P0 remediation draft)
 -- Migration: 001_initial_schema.sql
--- IMPORTANT: apply to Marketing DB only, never to Scimior production DB.
+-- IMPORTANT: apply to a dedicated Marketing database only.
+-- Never run on Scimior or any shared/production database in this phase.
+--
+-- This SQL is a specification artifact until validated in an isolated disposable
+-- PostgreSQL environment.
 
 BEGIN;
 
--- Safety guard: prevent accidental execution on Scimior database names.
+-- ---------------------------------------------------------------------------
+-- Safety guard (defense in depth only)
+-- ---------------------------------------------------------------------------
+-- This check is intentionally conservative, but it is not sufficient alone.
+-- The migration runner must still enforce URL equality checks and target identity.
 DO $$
 BEGIN
-    IF current_database() ILIKE '%scimior%' THEN
+    IF current_database() IN ('salon_nxt', 'scimior', 'postgres')
+       OR current_database() ILIKE '%scimior%'
+       OR current_database() ILIKE '%salon%' THEN
         RAISE EXCEPTION 'Refusing to run marketing migration on database: %', current_database();
     END IF;
 END $$;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- Role model (no BYPASSRLS application roles)
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'marketing_owner') THEN
+        CREATE ROLE marketing_owner NOLOGIN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'marketing_app_role') THEN
+        CREATE ROLE marketing_app_role NOINHERIT;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'marketing_service_role') THEN
+        CREATE ROLE marketing_service_role NOINHERIT;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'marketing_bootstrap_role') THEN
+        CREATE ROLE marketing_bootstrap_role NOINHERIT;
+    END IF;
+END $$;
+
+COMMENT ON ROLE marketing_owner IS 'Schema owner and migration executor only.';
+COMMENT ON ROLE marketing_app_role IS 'Tenant-scoped runtime role for authenticated tenant APIs.';
+COMMENT ON ROLE marketing_service_role IS 'Privileged role for audited service workflows only.';
+COMMENT ON ROLE marketing_bootstrap_role IS 'Restricted role for pre-tenant bootstrap flows.';
 
 -- ---------------------------------------------------------------------------
 -- Helper context functions for RLS
@@ -38,6 +75,7 @@ $$;
 -- ---------------------------------------------------------------------------
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    full_name TEXT NOT NULL,
     email TEXT NOT NULL,
     email_normalized TEXT NOT NULL UNIQUE,
     password_hash TEXT,
@@ -382,6 +420,22 @@ CREATE TABLE marketing_jobs (
 );
 CREATE INDEX idx_jobs_claim ON marketing_jobs(status, available_at, lock_expires_at);
 
+CREATE TABLE idempotency_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    scope_key TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    request_method TEXT NOT NULL,
+    response_status_code INTEGER,
+    response_body JSONB,
+    locked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (scope_key, endpoint, request_hash)
+);
+CREATE INDEX idx_idempotency_org_exp ON idempotency_keys(organization_id, endpoint, expires_at);
+
 -- ---------------------------------------------------------------------------
 -- Conversations, messages and webhook events
 -- ---------------------------------------------------------------------------
@@ -418,7 +472,7 @@ CREATE TABLE messages (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     FOREIGN KEY (organization_id, conversation_id) REFERENCES conversations(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, contact_id) REFERENCES contacts(organization_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (organization_id, campaign_id) REFERENCES campaigns(organization_id, id) ON DELETE SET NULL
+    FOREIGN KEY (organization_id, campaign_id) REFERENCES campaigns(organization_id, id) ON DELETE RESTRICT
 );
 CREATE INDEX idx_messages_org_convo_time ON messages(organization_id, conversation_id, created_at DESC);
 CREATE INDEX idx_messages_provider_msg ON messages(provider_message_id);
@@ -433,7 +487,7 @@ CREATE TABLE message_status_events (
     error_code TEXT,
     raw_payload JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    FOREIGN KEY (organization_id, message_id) REFERENCES messages(organization_id, id) ON DELETE SET NULL
+    FOREIGN KEY (organization_id, message_id) REFERENCES messages(organization_id, id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX uq_message_status_dedup
@@ -496,7 +550,32 @@ CREATE TABLE schema_migrations (
 );
 
 -- ---------------------------------------------------------------------------
--- RLS enablement and tenant policies
+-- Status rank enforcement
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION enforce_non_regressing_status_rank()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.status_rank < OLD.status_rank THEN
+        RAISE EXCEPTION 'Status rank regression is not allowed (% -> %)', OLD.status_rank, NEW.status_rank;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_campaign_recipient_rank_no_regress
+BEFORE UPDATE ON campaign_recipients
+FOR EACH ROW
+EXECUTE FUNCTION enforce_non_regressing_status_rank();
+
+CREATE TRIGGER trg_messages_rank_no_regress
+BEFORE UPDATE ON messages
+FOR EACH ROW
+EXECUTE FUNCTION enforce_non_regressing_status_rank();
+
+-- ---------------------------------------------------------------------------
+-- RLS enablement and policy boundaries
 -- ---------------------------------------------------------------------------
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE organization_members ENABLE ROW LEVEL SECURITY;
@@ -515,6 +594,7 @@ ALTER TABLE audiences ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaigns ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaign_recipients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE marketing_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE message_status_events ENABLE ROW LEVEL SECURITY;
@@ -526,128 +606,385 @@ ALTER TABLE password_reset_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_terms_acceptance ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY organizations_tenant_policy ON organizations
-    USING (id = app_current_organization_id())
-    WITH CHECK (id = app_current_organization_id());
+ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
+ALTER TABLE organization_members FORCE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_accounts FORCE ROW LEVEL SECURITY;
+ALTER TABLE whatsapp_credentials FORCE ROW LEVEL SECURITY;
+ALTER TABLE onboarding_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE contacts FORCE ROW LEVEL SECURITY;
+ALTER TABLE contact_imports FORCE ROW LEVEL SECURITY;
+ALTER TABLE contact_groups FORCE ROW LEVEL SECURITY;
+ALTER TABLE contact_group_members FORCE ROW LEVEL SECURITY;
+ALTER TABLE contact_tags FORCE ROW LEVEL SECURITY;
+ALTER TABLE contact_tag_assignments FORCE ROW LEVEL SECURITY;
+ALTER TABLE consent_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE message_templates FORCE ROW LEVEL SECURITY;
+ALTER TABLE audiences FORCE ROW LEVEL SECURITY;
+ALTER TABLE campaigns FORCE ROW LEVEL SECURITY;
+ALTER TABLE campaign_recipients FORCE ROW LEVEL SECURITY;
+ALTER TABLE marketing_jobs FORCE ROW LEVEL SECURITY;
+ALTER TABLE idempotency_keys FORCE ROW LEVEL SECURITY;
+ALTER TABLE conversations FORCE ROW LEVEL SECURITY;
+ALTER TABLE messages FORCE ROW LEVEL SECURITY;
+ALTER TABLE message_status_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE usage_records FORCE ROW LEVEL SECURITY;
+ALTER TABLE auth_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE password_reset_tokens FORCE ROW LEVEL SECURITY;
+ALTER TABLE user_terms_acceptance FORCE ROW LEVEL SECURITY;
+ALTER TABLE users FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY organization_members_tenant_policy ON organization_members
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+-- Tenant-scoped policy template for marketing_app_role
+CREATE POLICY organizations_app_policy ON organizations
+    FOR ALL TO marketing_app_role
+    USING (id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_whatsapp_accounts ON whatsapp_accounts
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY organization_members_app_policy ON organization_members
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_whatsapp_credentials ON whatsapp_credentials
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_whatsapp_accounts_app ON whatsapp_accounts
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_onboarding_sessions ON onboarding_sessions
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_whatsapp_credentials_app ON whatsapp_credentials
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contacts ON contacts
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_onboarding_sessions_app ON onboarding_sessions
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contact_imports ON contact_imports
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contacts_app ON contacts
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contact_groups ON contact_groups
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contact_imports_app ON contact_imports
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contact_group_members ON contact_group_members
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contact_groups_app ON contact_groups
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contact_tags ON contact_tags
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contact_group_members_app ON contact_group_members
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_contact_tag_assignments ON contact_tag_assignments
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contact_tags_app ON contact_tags
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_consent_events ON consent_events
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_contact_tag_assignments_app ON contact_tag_assignments
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_message_templates ON message_templates
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_consent_events_app ON consent_events
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_audiences ON audiences
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_message_templates_app ON message_templates
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_campaigns ON campaigns
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_audiences_app ON audiences
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_campaign_recipients ON campaign_recipients
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_campaigns_app ON campaigns
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_marketing_jobs ON marketing_jobs
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_campaign_recipients_app ON campaign_recipients
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_conversations ON conversations
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_marketing_jobs_app ON marketing_jobs
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_messages ON messages
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_idempotency_app ON idempotency_keys
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_message_status_events ON message_status_events
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_conversations_app ON conversations
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_webhook_events ON webhook_events
-    USING (organization_id = app_current_organization_id() OR organization_id IS NULL)
-    WITH CHECK (organization_id = app_current_organization_id() OR organization_id IS NULL);
+CREATE POLICY tenant_scope_messages_app ON messages
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_audit_events ON audit_events
-    USING (organization_id = app_current_organization_id() OR organization_id IS NULL)
-    WITH CHECK (organization_id = app_current_organization_id() OR organization_id IS NULL);
+CREATE POLICY tenant_scope_message_status_events_app ON message_status_events
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY tenant_scope_usage_records ON usage_records
-    USING (organization_id = app_current_organization_id())
-    WITH CHECK (organization_id = app_current_organization_id());
+CREATE POLICY tenant_scope_webhook_events_app ON webhook_events
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY users_self_policy ON users
-    USING (id = app_current_user_id())
-    WITH CHECK (id = app_current_user_id());
+CREATE POLICY tenant_scope_audit_events_app ON audit_events
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY auth_sessions_self_policy ON auth_sessions
-    USING (user_id = app_current_user_id())
-    WITH CHECK (user_id = app_current_user_id());
+CREATE POLICY tenant_scope_usage_records_app ON usage_records
+    FOR ALL TO marketing_app_role
+    USING (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL)
+    WITH CHECK (organization_id = app_current_organization_id() AND app_current_organization_id() IS NOT NULL);
 
-CREATE POLICY password_reset_tokens_self_policy ON password_reset_tokens
-    USING (user_id = app_current_user_id())
-    WITH CHECK (user_id = app_current_user_id());
+CREATE POLICY users_self_app_policy ON users
+    FOR SELECT TO marketing_app_role
+    USING (id = app_current_user_id() AND app_current_user_id() IS NOT NULL);
 
-CREATE POLICY user_terms_acceptance_self_policy ON user_terms_acceptance
-    USING (user_id = app_current_user_id())
-    WITH CHECK (user_id = app_current_user_id());
+CREATE POLICY users_self_update_app_policy ON users
+    FOR UPDATE TO marketing_app_role
+    USING (id = app_current_user_id() AND app_current_user_id() IS NOT NULL)
+    WITH CHECK (id = app_current_user_id() AND app_current_user_id() IS NOT NULL);
+
+CREATE POLICY auth_sessions_self_app_policy ON auth_sessions
+    FOR ALL TO marketing_app_role
+    USING (user_id = app_current_user_id() AND app_current_user_id() IS NOT NULL)
+    WITH CHECK (user_id = app_current_user_id() AND app_current_user_id() IS NOT NULL);
+
+CREATE POLICY password_reset_tokens_self_app_policy ON password_reset_tokens
+    FOR SELECT TO marketing_app_role
+    USING (user_id = app_current_user_id() AND app_current_user_id() IS NOT NULL);
+
+CREATE POLICY user_terms_acceptance_self_app_policy ON user_terms_acceptance
+    FOR SELECT TO marketing_app_role
+    USING (user_id = app_current_user_id() AND app_current_user_id() IS NOT NULL);
+
+-- Service role policies (audited privileged operations)
+CREATE POLICY service_all_organizations ON organizations
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_organization_members ON organization_members
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_whatsapp_accounts ON whatsapp_accounts
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_whatsapp_credentials ON whatsapp_credentials
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_onboarding_sessions ON onboarding_sessions
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contacts ON contacts
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contact_imports ON contact_imports
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contact_groups ON contact_groups
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contact_group_members ON contact_group_members
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contact_tags ON contact_tags
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_contact_tag_assignments ON contact_tag_assignments
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_consent_events ON consent_events
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_message_templates ON message_templates
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_audiences ON audiences
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_campaigns ON campaigns
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_campaign_recipients ON campaign_recipients
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_marketing_jobs ON marketing_jobs
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_idempotency_keys ON idempotency_keys
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_conversations ON conversations
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_messages ON messages
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_message_status_events ON message_status_events
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_webhook_events ON webhook_events
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_audit_events ON audit_events
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_usage_records ON usage_records
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_users ON users
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_auth_sessions ON auth_sessions
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_password_reset_tokens ON password_reset_tokens
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_all_terms ON user_terms_acceptance
+    FOR ALL TO marketing_service_role USING (true) WITH CHECK (true);
+
+-- Bootstrap role policies (pre-tenant and unauthenticated lifecycle)
+CREATE POLICY bootstrap_insert_users ON users
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_update_users ON users
+    FOR UPDATE TO marketing_bootstrap_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_sessions ON auth_sessions
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_update_sessions ON auth_sessions
+    FOR UPDATE TO marketing_bootstrap_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_reset_tokens ON password_reset_tokens
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_update_reset_tokens ON password_reset_tokens
+    FOR UPDATE TO marketing_bootstrap_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_select_reset_tokens ON password_reset_tokens
+    FOR SELECT TO marketing_bootstrap_role
+    USING (true);
+
+CREATE POLICY bootstrap_insert_terms ON user_terms_acceptance
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_organizations ON organizations
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_organization_members ON organization_members
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_onboarding_sessions ON onboarding_sessions
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_update_onboarding_sessions ON onboarding_sessions
+    FOR UPDATE TO marketing_bootstrap_role
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_whatsapp_accounts ON whatsapp_accounts
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_whatsapp_credentials ON whatsapp_credentials
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_webhook_events ON webhook_events
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_audit_events ON audit_events
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_insert_jobs ON marketing_jobs
+    FOR INSERT TO marketing_bootstrap_role
+    WITH CHECK (true);
+
+CREATE POLICY bootstrap_update_jobs ON marketing_jobs
+    FOR UPDATE TO marketing_bootstrap_role
+    USING (true)
+    WITH CHECK (true);
+
+-- ---------------------------------------------------------------------------
+-- Grants (least privilege)
+-- ---------------------------------------------------------------------------
+GRANT USAGE ON SCHEMA public TO marketing_app_role, marketing_service_role, marketing_bootstrap_role;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+    users,
+    organizations,
+    organization_members,
+    auth_sessions,
+    password_reset_tokens,
+    user_terms_acceptance,
+    whatsapp_accounts,
+    whatsapp_credentials,
+    onboarding_sessions,
+    contacts,
+    contact_imports,
+    contact_groups,
+    contact_group_members,
+    contact_tags,
+    contact_tag_assignments,
+    consent_events,
+    message_templates,
+    audiences,
+    campaigns,
+    campaign_recipients,
+    marketing_jobs,
+    idempotency_keys,
+    conversations,
+    messages,
+    message_status_events,
+    webhook_events,
+    audit_events,
+    usage_records
+TO marketing_app_role, marketing_service_role, marketing_bootstrap_role;
+
+GRANT SELECT, INSERT, UPDATE ON TABLE schema_migrations TO marketing_owner;
+
+ALTER TABLE users OWNER TO marketing_owner;
+ALTER TABLE organizations OWNER TO marketing_owner;
+ALTER TABLE organization_members OWNER TO marketing_owner;
+ALTER TABLE auth_sessions OWNER TO marketing_owner;
+ALTER TABLE password_reset_tokens OWNER TO marketing_owner;
+ALTER TABLE user_terms_acceptance OWNER TO marketing_owner;
+ALTER TABLE whatsapp_accounts OWNER TO marketing_owner;
+ALTER TABLE whatsapp_credentials OWNER TO marketing_owner;
+ALTER TABLE onboarding_sessions OWNER TO marketing_owner;
+ALTER TABLE contacts OWNER TO marketing_owner;
+ALTER TABLE contact_imports OWNER TO marketing_owner;
+ALTER TABLE contact_groups OWNER TO marketing_owner;
+ALTER TABLE contact_group_members OWNER TO marketing_owner;
+ALTER TABLE contact_tags OWNER TO marketing_owner;
+ALTER TABLE contact_tag_assignments OWNER TO marketing_owner;
+ALTER TABLE consent_events OWNER TO marketing_owner;
+ALTER TABLE message_templates OWNER TO marketing_owner;
+ALTER TABLE audiences OWNER TO marketing_owner;
+ALTER TABLE campaigns OWNER TO marketing_owner;
+ALTER TABLE campaign_recipients OWNER TO marketing_owner;
+ALTER TABLE marketing_jobs OWNER TO marketing_owner;
+ALTER TABLE idempotency_keys OWNER TO marketing_owner;
+ALTER TABLE conversations OWNER TO marketing_owner;
+ALTER TABLE messages OWNER TO marketing_owner;
+ALTER TABLE message_status_events OWNER TO marketing_owner;
+ALTER TABLE webhook_events OWNER TO marketing_owner;
+ALTER TABLE audit_events OWNER TO marketing_owner;
+ALTER TABLE usage_records OWNER TO marketing_owner;
+ALTER TABLE schema_migrations OWNER TO marketing_owner;
 
 COMMIT;
 
--- VERIFY: list marketing tables with RLS disabled (must be empty)
--- SELECT relname AS table_name
--- FROM pg_class c
--- JOIN pg_namespace n ON n.oid = c.relnamespace
--- WHERE n.nspname = 'public'
---   AND c.relkind = 'r'
---   AND relname IN (
---     'organizations','organization_members','whatsapp_accounts','whatsapp_credentials','onboarding_sessions',
---     'contacts','contact_imports','contact_groups','contact_group_members','contact_tags','contact_tag_assignments',
---     'consent_events','message_templates','audiences','campaigns','campaign_recipients','marketing_jobs',
---     'conversations','messages','message_status_events','webhook_events','audit_events','usage_records',
---     'auth_sessions','password_reset_tokens','user_terms_acceptance','users'
---   )
---   AND NOT c.relrowsecurity
--- ORDER BY relname;
+-- VERIFY (static expectation checks only)
+-- 1) no marketing table in public schema has RLS disabled
+-- 2) webhook_events and audit_events tenant app policy does not allow organization_id IS NULL
+-- 3) no application role has BYPASSRLS

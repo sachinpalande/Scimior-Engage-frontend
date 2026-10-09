@@ -1,143 +1,89 @@
-# Scimior Marketing Database Schema Design (Remediated)
+# Scimior Marketing Database Schema Design
 
-Status: Canonical pre-development schema design
+Status: P0-remediated schema design
 Date: 2026-10-09
 
-## 1. Scope and goals
+## 1. Scope
 
-This document defines the canonical Marketing database design for MVP.
+This document defines the Marketing schema and security boundary for foundation work.
 
-Goals:
-- Strong tenant isolation
-- Durable campaign processing
-- Replay-safe webhook ingestion
-- Auditable consent and legal acceptance
-- Operationally safe coexistence with existing Scimior runtime
+This is still pre-implementation and pre-migration-validation documentation.
 
 ## 2. Hard boundaries
 
-- Use a separate Marketing PostgreSQL database connection and credentials.
-- Use separate migration history from Scimior backend.
-- No direct queries to Scimior tables.
+- Dedicated Marketing PostgreSQL database and connection pool.
+- No direct Marketing queries to Scimior tables.
 - No Prisma.
+- No Flutter-side changes in this remediation phase.
 
-## 3. Canonical tenancy model
+## 3. Role and ownership model
 
-- Tenant root: organizations
-- Membership: organization_members
-- Tenant key in owned tables: organization_id
+Defined roles:
+- marketing_owner: schema owner/migration executor only
+- marketing_app_role: tenant-scoped runtime API role
+- marketing_service_role: privileged audited workflows
+- marketing_bootstrap_role: public/pre-tenant bootstrap workflows
 
-## 4. Security model
+Controls:
+- No broad BYPASSRLS grant to application roles.
+- FORCE ROW LEVEL SECURITY on marketing tables.
+- Policies scoped by role (`TO marketing_app_role`, `TO marketing_service_role`, `TO marketing_bootstrap_role`).
 
-### 4.1 Row-level security
+NEEDS APPROVAL: exact GRANT set for marketing_service_role.
+- Recommended default: only object-level privileges required by webhook reconciliation and queue worker operations.
 
-- Enable RLS on tenant-owned tables.
-- API runtime sets transaction-scoped tenant context:
-  - app.current_organization_id
-  - app.current_user_id
-- RLS policies scope reads/writes to the active tenant context.
+## 4. Threat boundary of GUC-based RLS
 
-### 4.2 Role model
+RLS depends on transaction-scoped tenant context:
+- app.current_organization_id
+- app.current_user_id
 
-- marketing_owner: migration/admin only
-- marketing_app_role: tenant-scoped API runtime
-- marketing_service_role: privileged system workflows
+Boundary statement:
+- This mechanism enforces query-scoping discipline.
+- It does not replace infrastructure identity controls.
+- Compromised DB credentials remain high impact and must be mitigated with secret handling, role separation and auditing.
 
-NEEDS APPROVAL: exact grants for marketing_service_role for incident and reconciliation paths.
+## 5. Bootstrap paths (secure workflow definitions)
 
-### 4.3 Sensitive data
+Pre-tenant or public workflows use marketing_bootstrap_role only:
+- registration
+- login session creation
+- password reset issue/consume
+- first organization creation
+- public onboarding callback ingestion
+- initial webhook ingress record
 
-- Store only token ciphertext or external secret reference.
-- Never store plaintext provider access tokens.
-- Hash all session and reset tokens.
+Privileged background workflows use marketing_service_role:
+- webhook reconciliation
+- status fan-in/out updates
+- marketing job claim/retry/update
+- cross-tenant administrative reconciliation (audited)
 
-## 5. Domain tables
+Authenticated tenant APIs use marketing_app_role.
 
-### Identity and legal
-- users
-- auth_sessions
-- password_reset_tokens
-- user_terms_acceptance
+## 6. P0 data model corrections
 
-### Tenant and access
-- organizations
-- organization_members
+Implemented in 001_initial_schema.sql draft:
+- users.full_name added.
+- NULL-tenant global rows blocked from marketing_app_role read/write policies.
+- Service-only policies for global webhook/audit workflows.
+- Composite FK delete conflicts removed by using RESTRICT on problematic relations.
+- Idempotency generalized with idempotency_keys table.
+- Status-rank non-regression enforced via triggers.
 
-### WhatsApp integration
-- whatsapp_accounts
-- whatsapp_credentials
-- onboarding_sessions
+## 7. Migration-safety alignment
 
-### Contacts and consent
-- contacts
-- contact_groups
-- contact_group_members
-- contact_tags
-- contact_tag_assignments
-- consent_events
-- contact_imports
+SQL includes a defensive DB-name guard, but that guard is not sufficient alone.
+The migration runner is mandatory for robust target validation.
 
-### Campaigns and delivery
-- message_templates
-- audiences
-- campaigns
-- campaign_recipients
-- marketing_jobs
+## 8. Validation state
 
-### Inbox and event ingestion
-- conversations
-- messages
-- message_status_events
-- webhook_events
+- Static structural review: completed.
+- PostgreSQL parser/execution validation in disposable DB: NOT RUN in this workspace.
 
-### Operations
-- audit_events
-- usage_records
-- schema_migrations
+## 9. Open decisions
 
-## 6. Uniqueness and dedup strategy
-
-- users.email_normalized unique globally.
-- organization_members unique by (organization_id, user_id).
-- contacts unique by (organization_id, phone_e164).
-- whatsapp_accounts provider identifiers globally unique where present:
-  - (provider, phone_number_id)
-  - (provider, waba_id, phone_number_e164)
-- webhook_events dedup:
-  - (provider, provider_event_id) unique when provider_event_id exists
-  - event_fingerprint unique
-- message_status_events dedup:
-  - (provider_message_id, normalized_status, provider_timestamp, COALESCE(error_code,'')) unique
-
-## 7. Campaign status and retry controls
-
-- Campaign lifecycle: draft, scheduled, queued, sending, paused, completed, failed, cancelled.
-- Recipient lifecycle: queued, processing, submitted, sent, delivered, read, failed, cancelled, skipped.
-- Prevent status regression using monotonic status_rank checks.
-- Retry controls:
-  - attempt_count
-  - max_attempts
-  - next_retry_at
-  - last_error_code
-
-## 8. Webhook ingestion guarantees
-
-- Signature validation required before domain mutation.
-- Store webhook raw payload and verification metadata.
-- Idempotent write path via dedup unique indexes.
-- Out-of-order events never downgrade terminal states.
-
-## 9. Migration and environment safety
-
-- SQL migration must reject accidental execution against Scimior DB names.
-- Migration numbers are strict and never reused.
-- Never edit already applied migration files.
-
-See MARKETING_MIGRATION_CONVENTION.md.
-
-## 10. Open decisions
-
-- Pool sizing for app/service roles: NEEDS APPROVAL
-- Worker concurrency and claim batch size: NEEDS APPROVAL
-- Payload retention windows for webhook/messages: NEEDS APPROVAL
-- Exact allowed host pattern for DB safety guard: NEEDS APPROVAL
+- Service-role grant minimization details: NEEDS APPROVAL
+- Worker concurrency caps and claim batch size: NEEDS APPROVAL
+- Idempotency and payload retention TTLs: NEEDS APPROVAL
+- Approved DB host/database allowlist pattern: NEEDS APPROVAL

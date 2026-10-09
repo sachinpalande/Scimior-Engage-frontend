@@ -1,109 +1,62 @@
 # Finding Resolution Changelog
 
-Status: Remediation traceability log
+Status: Updated after P0 remediation patch set
 Date: 2026-10-09
 
-## Mapping format
+## Status legend
 
-- Finding ID
-- Original severity
-- Resolution summary
-- Files changed
-- Residual status
+- RESOLVED_IN_SPEC: documented and encoded in draft artifacts
+- IMPLEMENTATION_PENDING: runtime feature not yet built
+- VALIDATION_PENDING: disposable DB/runtime validation not yet executed
+- NEEDS_APPROVAL: decision required before relevant gate
 
-## Resolutions
+## Findings
 
-### F-P0-001 (Critical) API route conflicts
-- Resolution: Canonical API contract standardized to /api/marketing/v1; legacy route examples marked non-normative.
-- Files changed:
-  - CANONICAL_API_CONTRACT.md
-  - IMPLEMENTATION_GUIDE.md
-  - Scimior_Marketing_Architecture_Design_UPDATED.md
-  - Scimior_Marketing_User_Registration_WhatsApp_Onboarding_UPDATED.md
-  - WhatsApp_Marketing_Application_Detailed_PRD_UPDATED.md
-  - whatsappMarketing_UPDATED.md
-- Residual: CLOSED
+### F-P0-001 API route conflicts
+- Resolution: canonical /api/marketing/v1 retained and reconciled.
+- Files: CANONICAL_API_CONTRACT.md, IMPLEMENTATION_GUIDE.md, architecture/onboarding/PRD docs.
+- Status: RESOLVED_IN_SPEC
 
-### F-P0-002 (Critical) Tenant model conflict
-- Resolution: Canonical model set to organizations / organization_members / organization_id across specs.
-- Files changed:
-  - CANONICAL_API_CONTRACT.md
-  - DATABASE_SCHEMA_DESIGN.md
-  - Scimior_Marketing_User_Registration_WhatsApp_Onboarding_UPDATED.md
-  - WhatsApp_Marketing_Application_Detailed_PRD_UPDATED.md
-- Residual: CLOSED
+### F-P0-002 Tenant model conflicts
+- Resolution: organizations model retained across docs and SQL.
+- Files: CANONICAL_API_CONTRACT.md, DATABASE_SCHEMA_DESIGN.md, 001_initial_schema.sql.
+- Status: RESOLVED_IN_SPEC
 
-### F-P0-003 (Critical) WhatsApp asset duplication risk
-- Resolution: SQL now enforces global provider identity uniqueness for key WhatsApp assets.
-- Files changed:
-  - 001_initial_schema.sql
-  - DATABASE_SCHEMA_DESIGN.md
-- Residual: CLOSED
+### F-P0-003 WhatsApp identity duplication risk
+- Resolution: provider identity uniqueness retained in SQL.
+- Files: 001_initial_schema.sql, DATABASE_SCHEMA_DESIGN.md.
+- Status: RESOLVED_IN_SPEC, VALIDATION_PENDING
 
-### F-P0-004 (Critical) Missing DB tenant hardening
-- Resolution: RLS-based tenant security model documented and encoded in SQL policies.
-- Files changed:
-  - 001_initial_schema.sql
-  - DATABASE_SCHEMA_DESIGN.md
-  - ADR_001_TENANT_SECURITY_AND_WORKER_HOSTING.md
-- Residual: CLOSED
+### F-P0-004 Tenant security hardening gap
+- Resolution:
+  - role model encoded in SQL (owner/app/service/bootstrap)
+  - force RLS enabled
+  - app role blocked from NULL-tenant global rows
+  - service-only global workflow access
+- Files: 001_initial_schema.sql, ADR_001_TENANT_SECURITY_AND_WORKER_HOSTING.md, DATABASE_SCHEMA_DESIGN.md.
+- Status: RESOLVED_IN_SPEC, VALIDATION_PENDING
 
-### F-P1-001 (High) Missing graceful worker shutdown spec
-- Resolution: Worker lifecycle and graceful shutdown spec added.
-- Files changed:
-  - ADR_001_TENANT_SECURITY_AND_WORKER_HOSTING.md
-  - DATABASE_SCHEMA_DESIGN.md
-- Residual: CLOSED
+### F-P0-005 Missing bootstrap path definitions
+- Resolution: bootstrap role workflows defined for register/login/reset/first-org/onboarding callback/webhook ingress.
+- Files: 001_initial_schema.sql, CANONICAL_API_CONTRACT.md, DATABASE_SCHEMA_DESIGN.md.
+- Status: RESOLVED_IN_SPEC, IMPLEMENTATION_PENDING, VALIDATION_PENDING
 
-### F-P1-002 (High) Shared process contention risk
-- Resolution: Concurrency and pool-budget controls documented.
-- Files changed:
-  - ADR_001_TENANT_SECURITY_AND_WORKER_HOSTING.md
-  - DEVELOPMENT_READINESS_CHECKLIST_REMEDIATED.md
-- Residual: NEEDS APPROVAL (exact limits)
+### F-P0-006 Migration target safety gap
+- Resolution: migration runner design now mandates MARKETING_DATABASE_URL-only execution, URL equality rejection, explicit target identity allowlist and checksum/order checks.
+- Files: MARKETING_MIGRATION_CONVENTION.md, 001_initial_schema.sql.
+- Status: RESOLVED_IN_SPEC, IMPLEMENTATION_PENDING, NEEDS_APPROVAL (allowlist pattern)
 
-### F-P1-003 (High) Marketing CORS domain not listed in backend defaults
-- Resolution: Documented as implementation prerequisite for launch configuration.
-- Files changed:
-  - IMPLEMENTATION_GUIDE.md
-  - DEVELOPMENT_READINESS_CHECKLIST_REMEDIATED.md
-- Residual: NEEDS APPROVAL (final allowed-origin set)
+### F-P0-007 Composite FK delete conflicts
+- Resolution: conflicting composite `ON DELETE SET NULL` actions replaced with RESTRICT semantics.
+- Files: 001_initial_schema.sql.
+- Status: RESOLVED_IN_SPEC, VALIDATION_PENDING
 
-### F-P1-004 (High) No webhook verification pattern
-- Resolution: Canonical verification, replay and out-of-order handling requirements formalized.
-- Files changed:
-  - CANONICAL_API_CONTRACT.md
-  - DATABASE_SCHEMA_DESIGN.md
-  - 001_initial_schema.sql
-- Residual: CLOSED
+### F-P0-008 Contract/schema misalignment
+- Resolution: users.full_name, generic idempotency table, status-rank trigger enforcement and migration numbering examples reconciled.
+- Files: 001_initial_schema.sql, CANONICAL_API_CONTRACT.md, DATABASE_SCHEMA_DESIGN.md, MARKETING_MIGRATION_CONVENTION.md.
+- Status: RESOLVED_IN_SPEC, VALIDATION_PENDING
 
-### F-P1-005 (High) Migration governance risk
-- Resolution: Dedicated Marketing migration convention defined.
-- Files changed:
-  - MARKETING_MIGRATION_CONVENTION.md
-  - DATABASE_SCHEMA_DESIGN.md
-- Residual: CLOSED
-
-### F-P1-006 (High) Salon-coupled auth reuse risk
-- Resolution: Independent Marketing auth/authorization model specified.
-- Files changed:
-  - CANONICAL_API_CONTRACT.md
-  - IMPLEMENTATION_GUIDE.md
-  - Scimior_Marketing_User_Registration_WhatsApp_Onboarding_UPDATED.md
-- Residual: CLOSED
-
-### F-P2-002 (Medium) Missing terms/privacy acceptance schema
-- Resolution: user_terms_acceptance table and related requirements added.
-- Files changed:
-  - 001_initial_schema.sql
-  - DATABASE_SCHEMA_DESIGN.md
-  - CANONICAL_API_CONTRACT.md
-- Residual: CLOSED
-
-### F-P2-003 (Medium) Event dedup transition ambiguity
-- Resolution: dedup and out-of-order constraints and transition guards documented; SQL dedup indexes added.
-- Files changed:
-  - 001_initial_schema.sql
-  - DATABASE_SCHEMA_DESIGN.md
-  - CANONICAL_API_CONTRACT.md
-- Residual: CLOSED
+### F-P1 Shared-process operational decisions
+- Resolution: still explicit decisions with defaults; not runtime-implemented.
+- Files: ADR_001_TENANT_SECURITY_AND_WORKER_HOSTING.md, DEVELOPMENT_READINESS_CHECKLIST_REMEDIATED.md.
+- Status: NEEDS_APPROVAL

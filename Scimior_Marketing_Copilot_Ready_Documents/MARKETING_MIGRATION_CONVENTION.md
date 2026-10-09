@@ -1,78 +1,84 @@
 # Marketing Migration Convention
 
-Status: Canonical process for Marketing DB migrations
+Status: Updated with runner design
 Date: 2026-10-09
 
 ## 1. Scope
 
-This convention applies only to the Marketing database.
+Applies only to Marketing database migrations.
 
-- Never run Marketing migrations against Scimior production database.
-- Marketing migration history is independent from Scimior migration history.
+Never run Marketing migrations against Scimior or shared/production DB in this phase.
 
-## 2. Naming and ordering
+## 2. Versioning and numbering
 
-- Deterministic numeric ordering with zero padding:
-  - 001_initial_schema.sql
-  - 002_add_terms_acceptance.sql
-  - 003_add_campaign_retry_controls.sql
-- Do not reuse or duplicate migration numbers.
-- Never edit an applied migration; add a new migration.
+- Strict numeric ordering with zero padding.
+- Never edit applied migration files.
+- Next example versions after 001:
+  - 002_add_provider_signature_materialization.sql
+  - 003_add_retention_policy_indexes.sql
 
-## 3. Tracking table
+## 3. Required runner behavior (mandatory)
 
-Maintain a migration tracking table in Marketing DB:
+Runner must read only:
+- MARKETING_DATABASE_URL
+- SCIMIOR_DATABASE_URL (for anti-target-equality checks)
 
-- schema_migrations
-  - version (text primary key)
-  - checksum (text)
-  - applied_at (timestamptz)
-  - applied_by (text)
+Runner must fail fast when:
+- MARKETING_DATABASE_URL is missing.
+- MARKETING_DATABASE_URL equals SCIMIOR_DATABASE_URL.
+- Parsed target identity is not in approved allowlist.
+- schema_migrations checksum mismatch is detected.
+- migration order is non-sequential.
 
-Migration runner must verify checksum before marking applied.
+NEEDS APPROVAL: exact approved identity allowlist pattern.
+Recommended default: exact host + database name allowlist, no wildcard database names.
 
-## 4. Environment promotion
+## 4. Target identity validation
 
-Order:
-1. local dev
-2. shared dev
-3. staging
-4. production
+Before execution, runner must parse and print non-secret identity fields:
+- host
+- port
+- database name
+- ssl mode
 
-Promotion requirements:
-- SQL review complete
-- rollback/recovery documented
-- dry-run/static validation completed
-- compatibility notes reviewed
+Then validate against approved allowlist and abort on mismatch.
 
-## 5. Rollback and recovery guidance
+## 5. Tracking and checksums
 
-- Prefer forward-fix migrations over destructive rollbacks.
-- For destructive changes, include explicit backup and restore notes.
-- If partial apply occurs, halt promotion and create a recovery migration.
+Use schema_migrations:
+- version (PK)
+- checksum
+- applied_at
+- applied_by
 
-## 6. Safety controls
+Runner algorithm:
+1. Discover migration files in sorted order.
+2. Compute checksum for each file.
+3. Compare with applied records.
+4. Abort on divergence.
+5. Apply pending migrations in order inside transactions when safe.
+6. Insert schema_migrations row only after success.
 
-- Migration scripts require MARKETING_DATABASE_URL.
-- Runner must reject SCIMIOR_DATABASE_URL targets by name/allowlist checks.
-- Runner prints target DB identity and requires explicit confirmation in non-CI interactive mode.
+## 6. Safe stop behavior
 
-NEEDS APPROVAL: exact allowlist pattern for production database hostnames.
+On mismatch or error:
+- do not continue to later migrations
+- emit clear failure reason
+- return non-zero exit code
 
-## 7. Required migration header template
+## 7. Execution modes
 
-Each migration must begin with:
+- `dry-run`: parse files, evaluate order/checksums/target identity only.
+- `apply`: execute pending migrations after successful dry-run checks.
 
-- purpose
-- risk classification (low/medium/high)
-- backward compatibility note
-- rollback/recovery plan
-- verification queries
+## 8. Validation checklist per migration
 
-## 8. Verification checklist per migration
+- constraints and indexes present
+- role/grant and RLS policy checks pass
+- FK delete-action checks pass
+- relevant smoke verification queries documented
 
-- constraints validated
-- required indexes present
-- RLS/policies validated for new tenant tables
-- query plans checked for critical paths
-- schema_migrations updated
+## 9. Validation status in this workspace
+
+Runner implementation: NOT IMPLEMENTED (spec-only).
+Disposable PostgreSQL apply test: NOT RUN.
